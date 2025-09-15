@@ -11,17 +11,18 @@ const app = express();
 // 🔐 Load .env config
 dotenv.config();
 
-// 🛡️ Middlewares
-app.use(cors());
-app.use(express.json());
-app.use(express.static(__dirname));
-
-// 📁 Excel storage folder
+// 📁 Excel storage folder (define BEFORE using it)
 const EXPORTS_DIR = path.join(__dirname, "exports");
 if (!fs.existsSync(EXPORTS_DIR)) {
   fs.mkdirSync(EXPORTS_DIR);
 }
 const SALES_EXCEL_PATH = path.join(EXPORTS_DIR, "sales.xlsx");
+
+// 🛡️ Middlewares
+app.use(cors());
+app.use(express.json());
+app.use(express.static(__dirname));
+app.use('/exports', express.static(EXPORTS_DIR)); // ✅ Now correctly set up
 
 // ----------------------
 // 🔗 MongoDB Connection
@@ -92,6 +93,40 @@ app.delete("/api/products/:id", async (req, res) => {
 // ----------------------
 // 🛒 SALES ROUTES
 // ----------------------
+
+// 📈 Get sales by channel (with specific fields)
+app.get("/api/sales/:channel", async (req, res) => {
+  try {
+    const { channel } = req.params;
+
+    const sales = await Sale.find({ channel })
+      .sort({ date: -1 })
+      .populate("items.productId", "sku");
+
+    if (!sales.length) {
+      return res.status(404).json({ message: "No sales found for this channel" });
+    }
+
+    const result = [];
+
+    sales.forEach((sale) => {
+      sale.items.forEach((item) => {
+        result.push({
+          channel: sale.channel,
+          date: new Date(sale.date).toLocaleDateString("en-GB"),
+          sku: item.productId?.sku || "-",
+          quantity: item.quantity,
+        });
+      });
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error("❌ Error fetching sales by channel:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/api/sales", async (req, res) => {
   try {
     const { channel, items, date } = req.body;
@@ -100,7 +135,6 @@ app.post("/api/sales", async (req, res) => {
       return res.status(400).json({ error: "No items provided" });
     }
 
-    // Validate and check stock
     for (let item of items) {
       if (!mongoose.Types.ObjectId.isValid(item.productId)) {
         return res.status(400).json({ error: `Invalid productId: ${item.productId}` });
@@ -111,14 +145,12 @@ app.post("/api/sales", async (req, res) => {
       }
     }
 
-    // Decrease stock
     for (let item of items) {
       await Product.findByIdAndUpdate(item.productId, {
         $inc: { quantity: -item.quantity },
       });
     }
 
-    // Save to DB
     const sale = new Sale({
       channel,
       items,
@@ -126,7 +158,6 @@ app.post("/api/sales", async (req, res) => {
     });
     await sale.save();
 
-    // Save to Excel
     const workbook = new ExcelJS.Workbook();
     if (fs.existsSync(SALES_EXCEL_PATH)) {
       await workbook.xlsx.readFile(SALES_EXCEL_PATH);
@@ -246,7 +277,42 @@ app.get("/api/sales/export", async (req, res) => {
     console.error("❌ Excel export error:", err);
     res.status(500).json({ error: err.message });
   }
+});app.get("/api/sales/export/download", async (req, res) => {
+  try {
+    const sales = await Sale.find().populate("items.productId", "name sku");
+
+    if (!sales.length) {
+      return res.status(404).send("No sales data found");
+    }
+
+    const data = [];
+    sales.forEach((sale) => {
+      sale.items.forEach((item) => {
+        data.push({
+          Channel: sale.channel,
+          Date: new Date(sale.date).toLocaleDateString("en-GB"),
+          Product: item.productId?.name || "Unknown",
+          SKU: item.productId?.sku || "-",
+          Quantity: item.quantity,
+        });
+      });
+    });
+
+    const worksheet = XLSX.utils.json_to_sheet(data);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Sales");
+
+    const buffer = XLSX.write(workbook, { bookType: "xlsx", type: "buffer" });
+
+    res.setHeader("Content-Disposition", 'attachment; filename="sales_export.xlsx"');
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.send(buffer);
+  } catch (err) {
+    console.error("❌ Excel download error:", err);
+    res.status(500).send("Failed to generate Excel file");
+  }
 });
+
 
 // ----------------------
 // 🚀 START SERVER
